@@ -1,0 +1,9 @@
+post_install() {
+    printf '%s\n' 'Enable the user service with:'
+    printf '%s\n' '  systemctl --user enable --now appimage-desktop-sync.service'
+}
+
+post_upgrade() {
+    printf '%s\n' 'Restart the user service to load the updated script:'
+    printf '%s\n' '  systemctl --user restart appimage-desktop-sync.service'
+}
