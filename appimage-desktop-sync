@@ -39,6 +39,7 @@ write_launcher() {
     stem=${filename%.*}
     display=$(printf '%s' "$stem" | sed 's/[-_][-_]*/ /g' | tr '\r\n' '  ')
     executable=$(desktop_exec_path "$appimage") || return 1
+    working_directory=${appimage%/*}
     temporary=$(mktemp "$APPLICATIONS_DIR/.appimage-sync.XXXXXX") || return 1
 
     {
@@ -48,6 +49,7 @@ write_launcher() {
         printf 'Name=%s\n' "$display"
         printf '%s\n' 'Comment=Portable AppImage'
         printf 'Exec=%s %%U\n' "$executable"
+        printf 'Path=%s\n' "$working_directory"
         printf '%s\n' 'Icon=application-x-executable'
         printf '%s\n' 'Terminal=false'
         printf '%s\n' 'Categories=Utility;'
