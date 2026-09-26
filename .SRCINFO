@@ -1,7 +1,7 @@
 pkgbase = appimage-desktop-sync
 	pkgdesc = Event-driven AppImage desktop launcher synchronizer
 	pkgver = 0.1.0
-	pkgrel = 1
+	pkgrel = 2
 	install = appimage-desktop-sync.install
 	arch = any
 	license = MIT
@@ -11,9 +11,9 @@ pkgbase = appimage-desktop-sync
 	source = appimage-desktop-sync.service
 	source = README.md
 	source = LICENSE
-	sha256sums = f7276d1499499865f4d4d75c58914c3a3d93ec5d3a83449d7be10d663aec47e8
+	sha256sums = 1e77ad4d5d532a8ba2d9f4dcd6ce1d23afc485f73008cf73e8effbdb1e7c9b03
 	sha256sums = 1008258bea01bcdf6177d7ccd7d46d0c55df77103aef876c9e8dbb04c679106c
-	sha256sums = e7e0b7156a120d069a98979bc56510071bb98255a1b143d14c5a8b1d13ae7617
+	sha256sums = 5ae57c539f2040eb76f65a2df61e93955840ad8ef236fb8ceab4a414042d642a
 	sha256sums = cf525a9626afe055da94df76b1a0ba0ea053d1fb939b0cdbb2b1312552772c9f
 
 pkgname = appimage-desktop-sync

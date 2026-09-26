@@ -31,34 +31,86 @@ launcher_name() {
     printf '%s%s-%s.desktop\n' "$PREFIX" "$slug" "$digest"
 }
 
+find_desktop_override() {
+    preferred=${1%.*}.desktop
+    if [ -f "$preferred" ]; then
+        printf '%s\n' "$preferred"
+        return 0
+    fi
+
+    directory=${1%/*}
+    find "$directory" -maxdepth 1 -type f \( -iname '*.appimage' -o -name '*.desktop' \) -print |
+        awk '
+            tolower($0) ~ /\.appimage$/ { appimages++ }
+            /\.desktop$/ { desktops++; desktop = $0 }
+            END {
+                if (appimages == 1 && desktops == 1) print desktop
+            }
+        '
+}
+
+write_desktop_override() {
+    awk -v marker="$MARKER" '
+        {
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+            sub(/[[:space:]]+$/, "", line)
+        }
+        line ~ /^\[/ {
+            desktop_entry = (line == "[Desktop Entry]")
+            if (desktop_entry) {
+                found = 1
+                print
+                print marker
+                next
+            }
+        }
+        desktop_entry && line ~ /^X-AppImage-Sync[[:space:]]*=/ { next }
+        { print }
+        END { if (!found) exit 1 }
+    ' "$1"
+}
+
 write_launcher() {
     relative=$1
     appimage=$2
     destination=$APPLICATIONS_DIR/$3
-    filename=${relative##*/}
-    stem=${filename%.*}
-    display=$(printf '%s' "$stem" | sed 's/[-_][-_]*/ /g' | tr '\r\n' '  ')
-    executable=$(desktop_exec_path "$appimage") || return 1
     working_directory=${appimage%/*}
+    override=$(find_desktop_override "$appimage") || return 1
     temporary=$(mktemp "$APPLICATIONS_DIR/.appimage-sync.XXXXXX") || return 1
 
-    {
-        printf '%s\n' '[Desktop Entry]'
-        printf '%s\n' 'Version=1.0'
-        printf '%s\n' 'Type=Application'
-        printf 'Name=%s\n' "$display"
-        printf '%s\n' 'Comment=Portable AppImage'
-        printf 'Exec=%s %%U\n' "$executable"
-        printf 'Path=%s\n' "$working_directory"
-        printf '%s\n' 'Icon=application-x-executable'
-        printf '%s\n' 'Terminal=false'
-        printf '%s\n' 'Categories=Utility;'
-        printf '%s\n' 'StartupNotify=true'
-        printf '%s\n' "$MARKER"
-    } >"$temporary" || {
-        rm -f "$temporary"
-        return 1
-    }
+    if [ -n "$override" ]; then
+        if ! write_desktop_override "$override" >"$temporary"; then
+            printf 'Skipping invalid or unreadable desktop override: %s\n' "$override" >&2
+            rm -f "$temporary"
+            return 0
+        fi
+    else
+        filename=${relative##*/}
+        stem=${filename%.*}
+        display=$(printf '%s' "$stem" | sed 's/[-_][-_]*/ /g' | tr '\r\n' '  ')
+        executable=$(desktop_exec_path "$appimage") || {
+            rm -f "$temporary"
+            return 1
+        }
+        {
+            printf '%s\n' '[Desktop Entry]'
+            printf '%s\n' 'Version=1.0'
+            printf '%s\n' 'Type=Application'
+            printf 'Name=%s\n' "$display"
+            printf '%s\n' 'Comment=Portable AppImage'
+            printf 'Exec=%s %%U\n' "$executable"
+            printf 'Path=%s\n' "$working_directory"
+            printf '%s\n' 'Icon=application-x-executable'
+            printf '%s\n' 'Terminal=false'
+            printf '%s\n' 'Categories=Utility;'
+            printf '%s\n' 'StartupNotify=true'
+            printf '%s\n' "$MARKER"
+        } >"$temporary" || {
+            rm -f "$temporary"
+            return 1
+        }
+    fi
 
     chmod 644 "$temporary" || {
         rm -f "$temporary"
@@ -163,7 +215,7 @@ watch_events() {
         --event delete \
         --event moved_from \
         --event moved_to \
-        --includei '\.appimage$' \
+        --includei '\.(appimage|desktop)$' \
         --format '%e' \
         "$ROOT" >"$event_pipe" &
     watcher_pid=$!
