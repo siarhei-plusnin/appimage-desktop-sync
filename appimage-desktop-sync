@@ -2,10 +2,15 @@
 
 set -u
 
+DATA_HOME=${XDG_DATA_HOME:-"$HOME/.local/share"}
+CACHE_HOME=${XDG_CACHE_HOME:-"$HOME/.cache"}
 ROOT=${APPIMAGE_ROOT:-"$HOME/Applications"}
-APPLICATIONS_DIR=${XDG_DATA_HOME:-"$HOME/.local/share"}/applications
+APPLICATIONS_DIR=$DATA_HOME/applications
+ICONS_DIR=$DATA_HOME/icons/appimage-sync
+CACHE_DIR=$CACHE_HOME/appimage-desktop-sync
 PREFIX=appimage-sync-
 MARKER=X-AppImage-Sync=true
+FALLBACK_ICON=application-x-executable
 
 desktop_exec_path() {
     escaped=$(
@@ -26,8 +31,7 @@ launcher_name() {
     )
     [ -n "$slug" ] || slug=appimage
     hash=$(printf '%s' "$relative" | sha256sum)
-    hash=${hash%% *}
-    digest=$(printf '%.10s' "$hash")
+    digest=$(printf '%.10s' "${hash%% *}")
     printf '%s%s-%s.desktop\n' "$PREFIX" "$slug" "$digest"
 }
 
@@ -43,9 +47,7 @@ find_desktop_override() {
         awk '
             tolower($0) ~ /\.appimage$/ { appimages++ }
             /\.desktop$/ { desktops++; desktop = $0 }
-            END {
-                if (appimages == 1 && desktops == 1) print desktop
-            }
+            END { if (appimages == 1 && desktops == 1) print desktop }
         '
 }
 
@@ -71,14 +73,276 @@ write_desktop_override() {
     ' "$1"
 }
 
+desktop_value() {
+    awk -F= -v wanted="$2" '
+        /^\[/ { in_entry = ($0 == "[Desktop Entry]"); next }
+        in_entry && $1 == wanted { sub(/^[^=]*=/, ""); print; exit }
+    ' "$1"
+}
+
+strip_embedded_actions() {
+    sed -e '/^\[Desktop Action /,$d' -e '/^Actions[[:space:]]*=/d' "$1"
+}
+
+normalize_embedded_desktop() {
+    file=$1
+    executable=$2
+    appimage_path=$3
+    working_directory=$4
+    icon_path=$5
+    display_name=$6
+    name=$(desktop_value "$file" Name)
+    exec_line=$(desktop_value "$file" Exec)
+    case $exec_line in
+        *%F*) suffix=' %F' ;;
+        *%U*) suffix=' %U' ;;
+        *%f*) suffix=' %f' ;;
+        *%u*) suffix=' %u' ;;
+        '') suffix=' %U' ;;
+        *) suffix= ;;
+    esac
+
+    set -- \
+        --set-key=Type --set-value=Application \
+        --set-key=Exec --set-value="$executable$suffix" \
+        --set-key=TryExec --set-value="$appimage_path" \
+        --set-key=Path --set-value="$working_directory" \
+        --set-key=Icon --set-value="$icon_path" \
+        --set-key=DBusActivatable --set-value=false \
+        --set-key=X-AppImage-Sync --set-value=true \
+        --remove-key=Hidden --remove-key=NoDisplay --remove-key=Actions
+    if [ -z "$name" ]; then
+        set -- "$@" --set-key=Name --set-value="$display_name"
+    fi
+    desktop-file-edit "$file" "$@" || return 1
+    desktop-file-edit "$file" --remove-key=X-Desktop-File-Install-Version
+}
+
+write_generated_desktop() {
+    display_name=$1
+    executable=$2
+    working_directory=$3
+    icon_path=$4
+    cat <<EOF
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=$display_name
+Comment=Portable AppImage
+Exec=$executable %U
+Path=$working_directory
+Icon=$icon_path
+Terminal=false
+Categories=Utility;
+StartupNotify=true
+$MARKER
+EOF
+}
+
+fingerprint() {
+    stat -c '%d:%i:%s:%y:%z' -- "$1" 2>/dev/null
+}
+
+icon_extension() {
+    signature=$(od -An -vtx1 -N8 -- "$1" 2>/dev/null | tr -d ' \n')
+    case $signature in
+        89504e470d0a1a0a*) printf '%s\n' png; return 0 ;;
+        2f2a2058504d*) printf '%s\n' xpm; return 0 ;;
+    esac
+    if LC_ALL=C grep -q '<svg' "$1" 2>/dev/null; then
+        printf '%s\n' svg
+        return 0
+    fi
+    return 1
+}
+
+safe_archive_path() {
+    case $1 in
+        ''|/*|*\\*) return 1 ;;
+    esac
+    case /$1/ in
+        */../*) return 1 ;;
+    esac
+    if printf '%s' "$1" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+        return 1
+    fi
+    return 0
+}
+
+safe_icon_name() {
+    safe_archive_path "$1" || return 1
+    case $1 in */*) return 1 ;; esac
+    return 0
+}
+
+extract_file() {
+    7z x -so "$1" -- "$2" >"$3" 2>/dev/null
+}
+
+archive_desktop() {
+    7z l -slt -ba "$1" 2>/dev/null |
+        awk -F ' = ' '$1 == "Path" && $2 !~ /\// && tolower($2) ~ /\.desktop$/ { print $2; exit }'
+}
+
+extract_icon() {
+    appimage_path=$1
+    stem=$2
+    desktop_path=$3
+    temporary_directory=$4
+    candidate=$temporary_directory/icon
+    embedded_ext=
+
+    if extract_file "$appimage_path" .DirIcon "$candidate"; then
+        if embedded_ext=$(icon_extension "$candidate"); then
+            return 0
+        fi
+        target=$(head -c 4096 "$candidate")
+        if safe_archive_path "$target" && extract_file "$appimage_path" "$target" "$candidate" &&
+            embedded_ext=$(icon_extension "$candidate"); then
+            return 0
+        fi
+    fi
+
+    icon_name=
+    if [ -n "$desktop_path" ]; then
+        icon_name=$(desktop_value "$desktop_path" Icon)
+        case $icon_name in
+            *.[sS][vV][gG]|*.[pP][nN][gG]|*.[xX][pP][mM]) icon_name=${icon_name%.*} ;;
+        esac
+    fi
+    [ -n "$icon_name" ] || icon_name=$stem
+    safe_icon_name "$icon_name" || return 1
+
+    for archive_path in \
+        "$icon_name.svg" "$icon_name.png" "$icon_name.xpm" \
+        "usr/share/icons/hicolor/scalable/apps/$icon_name.svg" \
+        "usr/share/icons/hicolor/512x512/apps/$icon_name.png" \
+        "usr/share/icons/hicolor/256x256/apps/$icon_name.png" \
+        "usr/share/icons/hicolor/128x128/apps/$icon_name.png" \
+        "usr/share/icons/hicolor/96x96/apps/$icon_name.png" \
+        "usr/share/icons/hicolor/64x64/apps/$icon_name.png" \
+        "usr/share/icons/hicolor/48x48/apps/$icon_name.png" \
+        "usr/share/icons/hicolor/32x32/apps/$icon_name.png" \
+        "usr/share/icons/hicolor/16x16/apps/$icon_name.png"; do
+        if extract_file "$appimage_path" "$archive_path" "$candidate" &&
+            embedded_ext=$(icon_extension "$candidate"); then
+            return 0
+        fi
+    done
+    return 1
+}
+
+load_embedded_resources() {
+    resource_appimage=$1
+    resource_stem=$2
+    resource_launcher=$3
+    cache_id=${resource_launcher%.desktop}
+    embedded_desktop=
+    embedded_icon=
+    embedded_ext=
+    mkdir -p "$CACHE_DIR" || return 1
+    resource_fingerprint=$(fingerprint "$resource_appimage") || return 0
+    state_file=$CACHE_DIR/$cache_id.state
+
+    if [ -f "$state_file" ]; then
+        IFS='|' read -r cached_fingerprint cached_ext <"$state_file" || :
+        if [ "${cached_fingerprint:-}" = "$resource_fingerprint" ]; then
+            [ ! -f "$CACHE_DIR/$cache_id.desktop" ] || embedded_desktop=$CACHE_DIR/$cache_id.desktop
+            case ${cached_ext:-} in
+                svg|png|xpm)
+                    if [ -f "$CACHE_DIR/$cache_id.icon" ]; then
+                        embedded_icon=$CACHE_DIR/$cache_id.icon
+                        embedded_ext=$cached_ext
+                    fi
+                    ;;
+            esac
+            return 0
+        fi
+    fi
+
+    rm -f "$CACHE_DIR/$cache_id.desktop" "$CACHE_DIR/$cache_id.icon"
+    temporary_directory=$(mktemp -d "$CACHE_DIR/.extract.XXXXXX") || return 1
+    desktop_path=$(archive_desktop "$resource_appimage")
+    if [ -n "$desktop_path" ] &&
+        extract_file "$resource_appimage" "$desktop_path" "$temporary_directory/embedded.desktop" &&
+        grep -q '^\[Desktop Entry\][[:space:]]*$' "$temporary_directory/embedded.desktop"; then
+        strip_embedded_actions "$temporary_directory/embedded.desktop" >"$CACHE_DIR/$cache_id.desktop"
+        embedded_desktop=$CACHE_DIR/$cache_id.desktop
+    elif [ -n "$desktop_path" ]; then
+        printf 'Ignoring invalid embedded desktop file: %s\n' "$desktop_path" >&2
+    fi
+
+    if extract_icon "$resource_appimage" "$resource_stem" "$embedded_desktop" "$temporary_directory"; then
+        cat "$temporary_directory/icon" >"$CACHE_DIR/$cache_id.icon"
+        embedded_icon=$CACHE_DIR/$cache_id.icon
+    else
+        embedded_ext=
+    fi
+    printf '%s|%s\n' "$resource_fingerprint" "$embedded_ext" >"$state_file"
+    rm -rf "$temporary_directory"
+}
+
+find_sibling_icon() {
+    sibling_appimage=$1
+    sibling_stem=$2
+    directory=${sibling_appimage%/*}
+    sibling_icon=
+    sibling_ext=
+    for candidate in \
+        "$directory/$sibling_stem".[sS][vV][gG] \
+        "$directory/$sibling_stem".[pP][nN][gG] \
+        "$directory/$sibling_stem".[xX][pP][mM] \
+        "$directory/.DirIcon"; do
+        if [ -f "$candidate" ]; then
+            detected=$(icon_extension "$candidate") || continue
+            sibling_icon=$candidate
+            sibling_ext=$detected
+            return 0
+        fi
+    done
+    return 1
+}
+
+install_managed_icon() {
+    source_icon=$1
+    extension=$2
+    cache_id=$3
+    managed_icon=
+    mkdir -p "$ICONS_DIR" || return 1
+    icon_temporary=$(mktemp "$ICONS_DIR/.$cache_id.XXXXXX") || return 1
+    if ! cat "$source_icon" >"$icon_temporary" || ! chmod 644 "$icon_temporary"; then
+        rm -f "$icon_temporary"
+        return 1
+    fi
+    icon_destination=$ICONS_DIR/$cache_id.$extension
+    if [ -f "$icon_destination" ] && cmp -s "$icon_temporary" "$icon_destination"; then
+        rm -f "$icon_temporary"
+    else
+        mv -f "$icon_temporary" "$icon_destination" || {
+            rm -f "$icon_temporary"
+            return 1
+        }
+    fi
+    managed_icon=$icon_destination
+}
+
 write_launcher() {
     relative=$1
     appimage=$2
-    destination=$APPLICATIONS_DIR/$3
+    name=$3
+    destination=$APPLICATIONS_DIR/$name
     working_directory=${appimage%/*}
-    override=$(find_desktop_override "$appimage") || return 1
-    temporary=$(mktemp "$APPLICATIONS_DIR/.appimage-sync.XXXXXX") || return 1
+    managed_icon=
 
+    if [ -e "$destination" ] || [ -L "$destination" ]; then
+        if ! grep -Fqx "$MARKER" "$destination" 2>/dev/null; then
+            printf 'Refusing to overwrite unmanaged launcher: %s\n' "$destination" >&2
+            return 0
+        fi
+    fi
+
+    override=$(find_desktop_override "$appimage") || return 1
+    temporary=$(mktemp "$APPLICATIONS_DIR/.appimage-sync.XXXXXX.desktop") || return 1
     if [ -n "$override" ]; then
         if ! write_desktop_override "$override" >"$temporary"; then
             printf 'Skipping invalid or unreadable desktop override: %s\n' "$override" >&2
@@ -93,36 +357,37 @@ write_launcher() {
             rm -f "$temporary"
             return 1
         }
-        {
-            printf '%s\n' '[Desktop Entry]'
-            printf '%s\n' 'Version=1.0'
-            printf '%s\n' 'Type=Application'
-            printf 'Name=%s\n' "$display"
-            printf '%s\n' 'Comment=Portable AppImage'
-            printf 'Exec=%s %%U\n' "$executable"
-            printf 'Path=%s\n' "$working_directory"
-            printf '%s\n' 'Icon=application-x-executable'
-            printf '%s\n' 'Terminal=false'
-            printf '%s\n' 'Categories=Utility;'
-            printf '%s\n' 'StartupNotify=true'
-            printf '%s\n' "$MARKER"
-        } >"$temporary" || {
+        load_embedded_resources "$appimage" "$stem" "$name" || {
             rm -f "$temporary"
             return 1
         }
+
+        if find_sibling_icon "$appimage" "$stem"; then
+            install_managed_icon "$sibling_icon" "$sibling_ext" "${name%.desktop}" ||
+                printf 'Could not install sibling icon: %s\n' "$sibling_icon" >&2
+        elif [ -n "$embedded_icon" ]; then
+            install_managed_icon "$embedded_icon" "$embedded_ext" "${name%.desktop}" ||
+                printf 'Could not install embedded icon: %s\n' "$appimage" >&2
+        fi
+        icon_path=${managed_icon:-$FALLBACK_ICON}
+
+        if [ -n "$embedded_desktop" ]; then
+            cat "$embedded_desktop" >"$temporary"
+            if ! normalize_embedded_desktop "$temporary" "$executable" "$appimage" \
+                "$working_directory" "$icon_path" "$display"; then
+                printf 'Could not normalize embedded desktop metadata: %s\n' "$appimage" >&2
+                write_generated_desktop "$display" "$executable" "$working_directory" "$icon_path" >"$temporary"
+            fi
+        else
+            write_generated_desktop "$display" "$executable" "$working_directory" "$icon_path" >"$temporary"
+        fi
     fi
 
     chmod 644 "$temporary" || {
         rm -f "$temporary"
         return 1
     }
-
     if [ -e "$destination" ] || [ -L "$destination" ]; then
-        if ! grep -Fqx "$MARKER" "$destination" 2>/dev/null; then
-            printf 'Refusing to overwrite unmanaged launcher: %s\n' "$destination" >&2
-            rm -f "$temporary"
-            return 0
-        fi
         if cmp -s "$temporary" "$destination"; then
             rm -f "$temporary"
             return 0
@@ -131,7 +396,6 @@ write_launcher() {
     else
         action=Created
     fi
-
     mv -f "$temporary" "$destination" || {
         rm -f "$temporary"
         return 1
@@ -142,30 +406,43 @@ write_launcher() {
 remove_stale_launchers() {
     manifest=$1
     for desktop in "$APPLICATIONS_DIR"/"$PREFIX"*.desktop; do
-        if [ ! -e "$desktop" ] && [ ! -L "$desktop" ]; then
-            continue
-        fi
-        if ! grep -Fqx "$MARKER" "$desktop" 2>/dev/null; then
-            continue
-        fi
+        [ -e "$desktop" ] || [ -L "$desktop" ] || continue
+        grep -Fqx "$MARKER" "$desktop" 2>/dev/null || continue
         name=${desktop##*/}
-        if grep -Fqx "$name" "$manifest"; then
-            continue
-        fi
-
+        grep -Fqx "$name" "$manifest" && continue
         rm -f "$desktop" || return 1
+        cache_id=${name%.desktop}
+        rm -f "$CACHE_DIR/$cache_id.desktop" "$CACHE_DIR/$cache_id.icon" "$CACHE_DIR/$cache_id.state"
         printf 'Removed: %s\n' "$desktop"
     done
 }
 
+remove_stale_icons() {
+    [ -d "$ICONS_DIR" ] || return 0
+    for icon in "$ICONS_DIR"/"$PREFIX"*; do
+        [ -f "$icon" ] || continue
+        referenced=0
+        for desktop in "$APPLICATIONS_DIR"/*.desktop; do
+            [ -f "$desktop" ] || continue
+            if grep -Fq "Icon=$icon" "$desktop" 2>/dev/null; then
+                referenced=1
+                break
+            fi
+        done
+        [ "$referenced" -eq 0 ] || continue
+        rm -f "$icon" || return 1
+        printf 'Removed: %s\n' "$icon"
+    done
+}
+
 synchronize() {
-    if [ ! -d "$ROOT" ]; then
+    [ -d "$ROOT" ] || {
         printf 'AppImage directory is unavailable: %s\n' "$ROOT" >&2
         return 1
-    fi
-
+    }
     mkdir -p "$APPLICATIONS_DIR" || return 1
     manifest=$(mktemp "$APPLICATIONS_DIR/.appimage-sync-manifest.XXXXXX") || return 1
+
     if ! find -H "$ROOT" -type f -iname '*.appimage' -print |
         LC_ALL=C sort |
         while IFS= read -r appimage; do
@@ -180,6 +457,10 @@ synchronize() {
     fi
 
     remove_stale_launchers "$manifest" || {
+        rm -f "$manifest"
+        return 1
+    }
+    remove_stale_icons || {
         rm -f "$manifest"
         return 1
     }
@@ -198,37 +479,24 @@ watch_events() {
         return 1
     }
     watcher_pid=
-
     cleanup_watch() {
-        if [ -n "$watcher_pid" ]; then
-            kill "$watcher_pid" 2>/dev/null || :
-        fi
+        [ -z "$watcher_pid" ] || kill "$watcher_pid" 2>/dev/null || :
         rm -f "$event_pipe"
         rmdir "$pipe_directory" 2>/dev/null || :
     }
     trap 'cleanup_watch' EXIT HUP INT TERM
 
     LC_ALL=C inotifywait --monitor --recursive --quiet \
-        --event attrib \
-        --event close_write \
-        --event create \
-        --event delete \
-        --event moved_from \
-        --event moved_to \
-        --includei '\.(appimage|desktop)$' \
-        --format '%e' \
-        "$ROOT" >"$event_pipe" &
+        --event attrib --event close_write --event create --event delete \
+        --event moved_from --event moved_to \
+        --includei '\.(appimage|desktop|png|svg|xpm)$|/\.DirIcon$' \
+        --format '%e' "$ROOT" >"$event_pipe" &
     watcher_pid=$!
-
-    while IFS= read -r event; do
+    while IFS= read -r _event; do
         synchronize || return 1
     done <"$event_pipe"
 
-    if wait "$watcher_pid"; then
-        status=0
-    else
-        status=$?
-    fi
+    if wait "$watcher_pid"; then status=0; else status=$?; fi
     watcher_pid=
     cleanup_watch
     trap - EXIT HUP INT TERM
@@ -242,21 +510,12 @@ usage() {
 command=${1:-}
 case $command in
     sync)
-        [ "$#" -eq 1 ] || {
-            usage
-            exit 2
-        }
+        [ "$#" -eq 1 ] || { usage; exit 2; }
         synchronize
         ;;
     watch)
-        [ "$#" -eq 1 ] || {
-            usage
-            exit 2
-        }
+        [ "$#" -eq 1 ] || { usage; exit 2; }
         watch_events
         ;;
-    *)
-        usage
-        exit 2
-        ;;
+    *) usage; exit 2 ;;
 esac

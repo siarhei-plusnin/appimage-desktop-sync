@@ -1,10 +1,10 @@
 pkgname=appimage-desktop-sync
 pkgver=0.1.0
-pkgrel=2
+pkgrel=5
 pkgdesc='Event-driven AppImage desktop launcher synchronizer'
 arch=('any')
 license=('MIT')
-depends=('desktop-file-utils' 'inotify-tools')
+depends=('7zip' 'desktop-file-utils' 'inotify-tools')
 install="${pkgname}.install"
 
 source=(
@@ -13,9 +13,9 @@ source=(
     'README.md'
     'LICENSE'
 )
-sha256sums=('1e77ad4d5d532a8ba2d9f4dcd6ce1d23afc485f73008cf73e8effbdb1e7c9b03'
+sha256sums=('329f8270e507fd745540c70b90b33d2016ac15a7da10472aa924dfd59d8ca1ca'
             '1008258bea01bcdf6177d7ccd7d46d0c55df77103aef876c9e8dbb04c679106c'
-            '5ae57c539f2040eb76f65a2df61e93955840ad8ef236fb8ceab4a414042d642a'
+            'f24a5085f8e6009cf947f49d14584604be3c172f9ddaeafc8e32eda41838ce16'
             'cf525a9626afe055da94df76b1a0ba0ea053d1fb939b0cdbb2b1312552772c9f')
 
 package() {
